@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { registerGristTools } from "./src/tools.js";
+import { registerGristTools } from "./tools.js";
 
 const PORT = process.env.PORT || 3939;
 const MCP_SERVER_TOKEN = process.env.MCP_SERVER_TOKEN;
