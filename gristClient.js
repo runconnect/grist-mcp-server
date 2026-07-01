@@ -137,4 +137,14 @@ export const grist = {
 
 };
 
-export { GRIST_API_URL };
+function downloadUrl(path, params = {}) {
+  const url = new URL(`${GRIST_API_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) {
+      url.searchParams.set(key, String(value));
+    }
+  }
+  return url.toString();
+}
+
+export { GRIST_API_URL, downloadUrl };
