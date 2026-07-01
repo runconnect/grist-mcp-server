@@ -45,6 +45,22 @@ async function gristFetch(path, options = {}) {
   return body;
 }
 
+/**
+ * Convertit une définition de colonne au format exposé par nos outils MCP
+ * ({ id, fields: { label, type, formula, isFormula } }) vers l'objet
+ * "colinfo" attendu par les actions internes Grist (AddColumn/ModifyColumn),
+ * en omettant les propriétés non fournies.
+ */
+function toColInfo(col) {
+  const info = { id: col.id };
+  const f = col.fields || {};
+  if (f.type !== undefined) info.type = f.type;
+  if (f.label !== undefined) info.label = f.label;
+  if (f.isFormula !== undefined) info.isFormula = f.isFormula;
+  if (f.formula !== undefined) info.formula = f.formula;
+  return info;
+}
+
 export const grist = {
   // --- Découverte ---
   listOrgs: () => gristFetch("/orgs"),
@@ -82,10 +98,114 @@ export const grist = {
   // Suppression via l'endpoint bas niveau /apply (actions internes Grist),
   // plus fiable que de deviner un endpoint DELETE non documenté de façon stable.
   deleteRecords: (docId, tableId, rowIds) =>
-    gristFetch(`/docs/${docId}/apply`, {
+    grist.applyActions(docId, [["BulkRemoveRecord", tableId, rowIds]]),
+
+  // Ajoute ou met à jour selon des critères-clé, via SQL pour la recherche
+  // puis addRecords/updateRecords.
+  upsertRecords: async (docId, tableId, records) => {
+    const results = [];
+    for (const { require, fields } of records) {
+      const filter = Object.fromEntries(
+        Object.entries(require).map(([k, v]) => [k, [v]])
+      );
+      const existing = await grist.getRecords(docId, tableId, { filter, limit: 1 });
+      const match = existing?.records?.[0];
+      if (match) {
+        await grist.updateRecords(docId, tableId, [{ id: match.id, fields }]);
+        results.push({ id: match.id, action: "update" });
+      } else {
+        const created = await grist.addRecords(docId, tableId, [{ ...require, ...fields }]);
+        results.push({ id: created?.records?.[0]?.id, action: "add" });
+      }
+    }
+    return { records: results };
+  },
+
+  // ── Actions bas niveau (format interne Grist) ──────────────────────────
+  // Applique une séquence d'actions internes Grist en une seule transaction
+  // via l'endpoint /apply. C'est le point de passage commun pour toutes les
+  // mutations de structure (tables/colonnes) ci-dessous.
+  applyActions: (docId, actions, noparse = false) =>
+    gristFetch(`/docs/${docId}/apply${noparse ? "?noparse=1" : ""}`, {
       method: "POST",
-      body: JSON.stringify([["BulkRemoveRecord", tableId, rowIds]]),
+      body: JSON.stringify(actions),
     }),
+
+  // ── Schéma — Tables ─────────────────────────────────────────────────────
+  createTables: (docId, tables) => {
+    const actions = tables.map((t) => [
+      "AddTable",
+      t.id,
+      (t.columns || []).map(toColInfo),
+    ]);
+    return grist.applyActions(docId, actions);
+  },
+
+  deleteTable: (docId, tableId) =>
+    grist.applyActions(docId, [["RemoveTable", tableId]]),
+
+  // Modifie les métadonnées d'une table. Le renommage du tableId technique
+  // passe par l'action dédiée RenameTable ; les autres métadonnées (ex:
+  // onDemand) sont appliquées via UpdateRecord sur la table interne
+  // _grist_Tables, en retrouvant son rowId par une requête SQL sur tableId.
+  updateTables: async (docId, tables) => {
+    const actions = [];
+    for (const { id, fields } of tables) {
+      const { tableId: newTableId, ...rest } = fields || {};
+      const renamed = newTableId && newTableId !== id;
+      if (renamed) {
+        actions.push(["RenameTable", id, newTableId]);
+      }
+      if (Object.keys(rest).length > 0) {
+        const targetId = renamed ? newTableId : id;
+        const result = await grist.runSql(
+          docId,
+          "SELECT id FROM _grist_Tables WHERE tableId = ?",
+          [targetId]
+        );
+        const row = result?.records?.[0];
+        const rowId = row?.fields?.id ?? row?.id;
+        if (rowId == null) {
+          throw new Error(`Table introuvable en métadonnées: ${targetId}`);
+        }
+        actions.push(["UpdateRecord", "_grist_Tables", rowId, rest]);
+      }
+    }
+    return grist.applyActions(docId, actions);
+  },
+
+  // ── Schéma — Colonnes ───────────────────────────────────────────────────
+  addColumns: (docId, tableId, columns) => {
+    const actions = columns.map((col) => {
+      const { id, ...info } = toColInfo(col);
+      return ["AddColumn", tableId, id, info];
+    });
+    return grist.applyActions(docId, actions);
+  },
+
+  updateColumns: (docId, tableId, columns) => {
+    const actions = columns.map((col) => {
+      const { id, ...info } = toColInfo(col);
+      return ["ModifyColumn", tableId, id, info];
+    });
+    return grist.applyActions(docId, actions);
+  },
+
+  // Ajoute une colonne si elle n'existe pas encore, sinon la modifie.
+  upsertColumns: async (docId, tableId, columns) => {
+    const existing = await grist.listColumns(docId, tableId);
+    const existingIds = new Set((existing?.columns || existing || []).map((c) => c.id));
+    const actions = columns.map((col) => {
+      const { id, ...info } = toColInfo(col);
+      return existingIds.has(id)
+        ? ["ModifyColumn", tableId, id, info]
+        : ["AddColumn", tableId, id, info];
+    });
+    return grist.applyActions(docId, actions);
+  },
+
+  deleteColumn: (docId, tableId, colId) =>
+    grist.applyActions(docId, [["RemoveColumn", tableId, colId]]),
 
   // --- Requête SQL en lecture seule (utile pour des agrégations/analyses) ---
   runSql: (docId, sql, args = []) =>
